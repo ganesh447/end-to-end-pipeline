@@ -2,6 +2,11 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
+from airflow.models.baseoperator import BaseOperator
+from google.cloud import storage
+from airflow.utils.context import Context
+import boto3
+from google.oauth2 import service_account
 from datetime import datetime, timedelta
 import requests
 import json
@@ -35,7 +40,8 @@ def fetch_reddit_posts(**context):
         })
 
     with open(local_file, "w") as f:
-        json.dump(posts, f, indent=4)
+        for post in posts:
+            f.write(json.dumps(post) + "\n")
 
     context['ti'].xcom_push(key="file_path", value=local_file)
 
@@ -52,6 +58,60 @@ def upload_to_s3(**context):
         bucket_name=S3_BUCKET,
         replace=True
     )
+
+def copy_s3_to_gcs(**context):
+    execution_date = context['ds']
+    filename = f"valorant_new_posts_{execution_date}.json"
+
+    # --- Download from S3 ---
+    s3_bucket = "testing47"
+    s3_key = f"project1/{filename}"
+    local_file = f"/tmp/{filename}"
+
+    s3 = S3Hook(aws_conn_id="aws_default")
+    s3.get_conn().download_file(s3_bucket, s3_key, local_file)
+
+    # --- Upload to GCS ---
+    gcs_bucket_name = "testing48"  #  GCS bucket
+    gcs_blob_path = f"{filename}"
+
+    credentials = service_account.Credentials.from_service_account_file(
+        "/opt/airflow/credentials/fit-accumulator-458615-u3-f4c215044155.json"
+    )
+    gcs_client = storage.Client(credentials=credentials)
+    bucket = gcs_client.bucket(gcs_bucket_name)
+    blob = bucket.blob(gcs_blob_path)
+    blob.upload_from_filename(local_file)
+
+    # Push the GCS path to XCom (optional if needed)
+    context['ti'].xcom_push(key='gcs_path', value=gcs_blob_path)
+
+def run_bigquery_insert(**context: Context):
+
+
+    ds = context["ds"]
+    uri = f"gs://testing48/valorant_new_posts_{ds}.json"
+
+    bq_operator = BigQueryInsertJobOperator(
+    task_id="gcs_to_bigquery",
+    configuration={
+        "load": {
+            "sourceUris": [uri],
+            "destinationTable": {
+                "projectId": "fit-accumulator-458615-u3",
+                "datasetId": "Valorant",
+                "tableId": "valorant_raw"
+            },
+            "sourceFormat": "NEWLINE_DELIMITED_JSON",
+            "autodetect": True,
+            "writeDisposition": "WRITE_APPEND",
+            "createDisposition": "CREATE_IF_NEEDED"   
+        }
+    },
+    gcp_conn_id="google_cloud_default"
+    )
+    return bq_operator.execute(context=context)
+
 
 # DAG definition
 default_args = {
@@ -81,22 +141,17 @@ with DAG(
         provide_context=True,
     )
 
-    bq_task = BigQueryInsertJobOperator(
-    task_id="s3_to_bigquery",
-    configuration={
-        "load": {
-            "sourceUris": ["s3://testing47/project1/valorant_reddit_{{ ds }}.json"],
-            "destinationTable": {
-                "projectId": "fit-accumulator-458615-u3",
-                "datasetId": "Valorant",
-                "tableId": "valorant_raw"
-            },
-            "sourceFormat": "NEWLINE_DELIMITED_JSON",
-            "autodetect": True,
-            "writeDisposition": "WRITE_APPEND"
-        }
-    },
-    gcp_conn_id="bigquery_default"
+    copy_to_gcs = PythonOperator(
+    task_id="copy_s3_to_gcs",
+    python_callable=copy_s3_to_gcs,
+    provide_context=True,
     )
 
-    fetch_task >> upload_task >> bq_task
+    bq_task = PythonOperator(
+    task_id="gcs_to_bigquery",
+    python_callable=run_bigquery_insert,
+    provide_context=True,
+    )
+
+    
+    fetch_task >> upload_task >> copy_to_gcs >> bq_task
